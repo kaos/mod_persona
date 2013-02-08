@@ -28,51 +28,99 @@
 
 %% interface functions
 -export([
-         observe_postback_notify/2
+         event/2,
+         observe_auth_logoff/3,
+         observe_session_context/3
         ]).
 
 -include_lib("zotonic.hrl").
 
--define(PPRINT(V), ?PRINT(V)).
-%-define(PPRINT(V), nop).
 
-observe_postback_notify(#postback_notify{ message="persona.login" }, Context) ->
-    Assertion = z_context:get_q(assertion, Context),
-    ?PPRINT(Assertion),
-    Msg = case check_assertion(Assertion, Context) of
-              {"okay", Info} -> 
-                  case persona_login(Info, Context) of
-                      ok -> "You have been logged in.";
-                      {ok, M} -> M;
-                      Err -> io_lib:format("Login failed: ~p.", [Err])
-                  end;
-              {"failed", Info} -> 
-                  io_lib:format("Login failed: ~p.", [proplists:get_value(reason, Info, "assertion failed")]);
-              Err -> 
-                  ?zWarning("Persona login assertion response error: ~p~n", [Err], Context),
-                  "Login failed: bad verification response."
-          end,
-    z_render:growl(Msg, Context);
-observe_postback_notify(#postback_notify{ message="persona.logout" }, Context) ->
-    z_render:wire({redirect, [{dispatch, logoff}]}, Context);
-observe_postback_notify(_, _Context) ->
-    undefined.
+event(#postback{ message={persona, [{event, Event}|Args]} }, Context) ->
+    persona(Event, Args, Context).
+
+observe_auth_logoff(auth_logoff, Context, _) ->
+    case z_context:get_session(persona_login, Context) of
+        true ->
+            %% ?DEBUG("#### auth_logoff"),
+            %% add script to let controller_logoff know we want to serve logoff.tpl
+            z_script:add_script("// persona logout...", Context);
+        _ -> Context
+    end.
+
+observe_session_context(session_context, Context, _) ->
+    case z_context:get_session(persona_login, Context) of
+        true ->
+            case z_auth:user_from_session(Context) of
+                undefined ->
+                    z_script:add_script("navigator.id.logout();", Context);
+                Id ->
+                    z_context:set(persona_user, Id, Context)
+            end;
+        _ -> Context
+    end.
+
 
 %%====================================================================
 %% support functions
 %%====================================================================
 
+persona("login", _Args, Context) ->
+    Assertion = z_context:get_q(assertion, Context),
+    {Msg, ContextMsg} = 
+        case check_assertion(Assertion, Context) of
+            {"okay", Info} -> 
+                case do_persona_login(Info, Context) of
+                    {ok, Ctx} -> 
+                        z_context:set_session(persona_login, true, Ctx),
+                        {"You have been logged in.",
+                         z_render:wire({redirect, [{location, get_ready_page(Ctx)}]}, Ctx)};
+                    {ok, M, Ctx} -> {M, Ctx};
+                    {error, Err} -> {io_lib:format("Login failed: ~p.", [Err]), Context}
+                end;
+            {"failed", Info} -> 
+                {io_lib:format("Login failed: ~p.", [proplists:get_value(reason, Info, "assertion failed")]), Context};
+            Err -> 
+                ?zWarning("Persona login assertion response error: ~p~n", [Err], Context),
+                {"Login failed: bad verification response.", Context}
+        end,
+    ?DEBUG("#### persona login"),
+    z_render:growl(Msg, ContextMsg);
+persona("logout", _Args, Context) ->
+    %% ?DEBUG("#### persona logout"),
+    z_context:set_session(persona_login, undefined, Context),
+    case z_auth:is_auth(Context) of
+        true -> z_render:wire({redirect, [{dispatch, "logoff"}]}, Context);
+        false -> Context
+    end.
+
+get_page(Context) ->
+    case z_context:get_q("p", Context, []) of
+        [] ->
+            RD = z_context:get_reqdata(Context),
+            case wrq:get_req_header("referer", RD) of
+                undefined -> "/";
+                Referrer -> Referrer
+            end;
+        Other ->
+            Other
+    end.
+
+get_ready_page(Context) ->
+    Page = get_page(Context),
+    case z_notifier:first(#logon_ready_page{ request_page=Page }, Context) of
+        undefined -> Page;
+        Url -> Url
+    end.
+             
 check_assertion(Assertion, Context) ->
     {Method, Req} = verify_req(Assertion, Context),
-    ?PPRINT(Req),
     Rsp = case httpc:request(Method, Req, [], []) of
               {ok, {{_, 200, _}, _Headers, Body}} ->
                   mochijson2:decode(Body);
-              Other ->
-                  ?PPRINT(Other),
+              _Other ->
                   []
           end,
-    ?PPRINT(Rsp),
     case z_convert:convert_json(Rsp) of
         [{status, Status}|Info] ->
             {z_convert:to_list(Status), Info};
@@ -93,18 +141,17 @@ verify_req(Assertion, Context) ->
 %% expires		The date the assertion expires, expressed as the primitive value of a Date object: that is, the number of milliseconds since midnight 01 January, 1970 UTC.
 %% issuer		The hostname of the identity provider that issued the assertion.
 
-persona_login(Info, Context) ->
-    ?PPRINT(Info),
+do_persona_login(Info, Context) ->
     {email, Email} = proplists:lookup(email, Info),
     case {m_identity:lookup_by_type_and_key(email, Email, Context),
           z_context:get_session(persona_login, Context)} of
         {undefined, signup} -> 
             z_context:set_session(persona_login, undefined, Context),
-            {ok, "Signup using your persona identity."};
+            {ok, "Signup using your persona identity.", Context};
         {undefined, logout} -> 
             z_context:set_session(persona_login, undefined, Context),
             z_context:add_script_page("navigator.id.logout();", Context),
-            {ok, "You are logged out."};
+            {ok, "You are logged out.", Context};
         {undefined, _} ->
             case z_notifier:first(#signup_url{ 
                                      props=[{title, Email}, {email, Email}],
@@ -117,19 +164,14 @@ persona_login(Info, Context) ->
                                          ]
                                     }, Context) of
                 {ok, Location} ->
-                    ?PPRINT(Location),
                     z_context:set_session(persona_login, signup, Context),
                     z_context:add_script_page(["window.location = \"", Location, "\";"], Context),
-                    {ok, "Redirecting to signup page..."};
+                    {ok, "Redirecting to signup page...", Context};
                 undefined -> 
                     z_context:set_session(persona_login, logout, Context),
-                    "Signups are disabled"
+                    {ok, "Signups are disabled", Context}
             end;
-        {Id, _} ->
-            ?PPRINT(Id),
-            case z_auth:logon(proplists:get_value(rsc_id, Id), Context) of
-                {ok, _} -> ok;
-                {error, Reason} -> Reason
-            end
+        {IdProps, _} ->
+            {rsc_id, RscId} = proplists:lookup(rsc_id, IdProps),
+            z_auth:logon(RscId, Context)
     end.
-
